@@ -10,10 +10,17 @@ const updateRelease = async () => {
   };
   const tag = process.env.GITHUB_REF_NAME;
 
-  const { data: currentRelease } = await octokit.rest.repos.getReleaseByTag({
+  const releases = await octokit.paginate(octokit.rest.repos.listReleases, {
     ...repo,
-    tag,
+    per_page: 100,
   });
+  const currentRelease = releases.find(
+    (release) => release.tag_name === tag,
+  );
+
+  if (!currentRelease) {
+    throw new Error(`release ${tag} was not found`);
+  }
   const latestAsset = currentRelease.assets.find(
     (item) => item.name === "latest.json",
   );

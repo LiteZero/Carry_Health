@@ -15,25 +15,30 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Create or reuse draft release
+        uses: actions/github-script@v7
         with:
-          fetch-depth: 0
-      - name: Set output
-        id: vars
-        run: echo "tag=${GITHUB_REF#refs/*/}" >> $GITHUB_OUTPUT
+          script: |
+            const tag = context.ref.replace("refs/tags/", "");
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { ...context.repo, per_page: 100 },
+            );
+            const existing = releases.find((release) => release.tag_name === tag);
 
-      # 安装 Node.js
-      - name: Setup node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+            if (existing) {
+              core.info(`Reusing release ${existing.id} for ${tag}`);
+              return;
+            }
 
-      # 发布 Release，使用自定义名称
-      - name: Generate changelog
-        id: create_release
-        run: npx changelogithub --draft --name ${{ steps.vars.outputs.tag }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            const { data: release } = await github.rest.repos.createRelease({
+              ...context.repo,
+              tag_name: tag,
+              name: `Shui ${tag}`,
+              draft: true,
+              generate_release_notes: true,
+            });
+            core.info(`Created release ${release.id} for ${tag}`);
 
   release:
     needs: create-release
