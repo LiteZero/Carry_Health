@@ -94,11 +94,28 @@ export default function ReminderPage() {
     gold: 0,
     drink: 0,
   });
-  const [countdown, setCountdown] = useState(30);
   const [monitorName, setMonitorName] = useState("");
   const { isLinux } = usePlatform();
   // 按天存储饮水量
   const todayDate = getTodayDate();
+
+  const refreshWater = async () => {
+    const config_store = await load(STORE_NAME.config, { autoSave: false });
+    const drinkHistory = await load(STORE_NAME.drink_history, {
+      autoSave: false,
+    });
+    const [goldSetting, drink = 0] = await Promise.all([
+      config_store.get<{
+        gold: number;
+      }>("alert"),
+      drinkHistory.get<number>(todayDate),
+    ]);
+
+    setWater({
+      gold: Number(goldSetting?.gold),
+      drink,
+    });
+  };
 
   // 根据饮水量随机选择提醒文案
   useEffect(() => {
@@ -115,13 +132,6 @@ export default function ReminderPage() {
   useEffect(() => {
     registerEscShortcut();
 
-    listen("countdown", (event) => {
-      setCountdown(event.payload as number);
-      if (event.payload === 0) {
-        setTimeout(hideWindowAction, 500);
-      }
-    });
-
     // TODO:被其他窗口隐藏时，注销快捷键
     // 待确认多屏场景下，是否需要注销快捷键
     listen("reminder_already_hidden", () => {
@@ -132,6 +142,7 @@ export default function ReminderPage() {
     listen(TauriEvent.WINDOW_FOCUS, () => {
       console.log("TauriEvent.WINDOW_FOCUS");
       registerEscShortcut();
+      refreshWater();
     });
 
     currentMonitor().then((mo) => {
@@ -178,26 +189,8 @@ export default function ReminderPage() {
   }, [monitorName]);
 
   useEffect(() => {
-    const storeUpdate = async () => {
-      const config_store = await load(STORE_NAME.config, { autoSave: false });
-      const drinkHistory = await load(STORE_NAME.drink_history, {
-        autoSave: false,
-      });
-      const [goldSetting, drink = 0] = await Promise.all([
-        config_store.get<{
-          gold: number;
-        }>("alert"),
-        drinkHistory.get<number>(todayDate),
-      ]);
-
-      setWater({
-        gold: Number(goldSetting?.gold),
-        drink,
-      });
-    };
-
-    storeUpdate();
-  }, [countdown]);
+    refreshWater();
+  }, []);
 
   const [isClosing, setIsClosing] = useState(false);
 
@@ -237,9 +230,6 @@ export default function ReminderPage() {
         isClosing ? "opacity-0" : "opacity-100"
       }`}
     >
-      <div className="absolute top-16 left-1/2 -translate-x-1/2 bg-white/30 backdrop-blur-sm px-4 py-2 rounded-full text-gray-700 text-base font-medium shadow-sm border border-white/20 transition-transform duration-300">
-        {countdown}s 后自动关闭
-      </div>
       <div
         className={`bg-white/30 backdrop-blur-sm p-8 rounded-2xl shadow-lg max-w-lg w-full z-10 border border-white/20 transition-all duration-100 ${
           isClosing ? "scale-95 opacity-0" : "scale-100 opacity-100"

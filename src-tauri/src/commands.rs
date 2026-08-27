@@ -6,48 +6,9 @@ use std::sync::atomic::Ordering;
 
 // Remove this line since we don't need it
 // use tauri::api::version::Version;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use timer::IS_RUNNING;
 use tokio::time::{sleep, Duration};
-
-use std::sync::Mutex;
-use tokio::sync::mpsc;
-
-// 只保留 channel 相关的静态变量
-static REMINDER_PAGE_COUNTDOWN_SENDER: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
-
-fn countdown_async(app_handle: tauri::AppHandle) {
-    // 取消之前的倒计时
-    if let Some(sender) = REMINDER_PAGE_COUNTDOWN_SENDER.lock().unwrap().take() {
-        let _ = sender.try_send(());
-    }
-
-    // 创建新的 channel
-    let (tx, mut rx) = mpsc::channel(1);
-    *REMINDER_PAGE_COUNTDOWN_SENDER.lock().unwrap() = Some(tx);
-
-    // 只在需要移动所有权到异步闭包时才 clone
-    let app_handle = app_handle.clone();
-    tauri::async_runtime::spawn(async move {
-        let mut countdown = 30;
-        let _ = app_handle.emit("countdown", countdown);
-
-        loop {
-            tokio::select! {
-                _ = rx.recv() => {
-                    break; // 收到取消信号
-                }
-                _ = sleep(Duration::from_secs(1)) => {
-                    countdown -= 1;
-                    let _ = app_handle.emit("countdown", countdown);
-                    if countdown <= 0 {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-}
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[tauri::command]
@@ -56,8 +17,6 @@ pub fn call_reminder(app_handle: tauri::AppHandle) -> bool {
 
     pause_timer();
     window::show_reminder_windows(&app_handle);
-
-    countdown_async(app_handle);
 
     true
 }
@@ -73,19 +32,12 @@ pub async fn call_reminder(app_handle: tauri::AppHandle) -> bool {
     // 直接传递引用，避免不必要的 clone
     window::show_reminder_windows(&app_handle);
 
-    countdown_async(app_handle);
-
     true
 }
 
 #[tauri::command]
 pub fn hide_reminder_windows(app_handle: tauri::AppHandle) {
     window::hide_reminder_windows(&app_handle);
-
-    // 取消之前的倒计时
-    if let Some(sender) = REMINDER_PAGE_COUNTDOWN_SENDER.lock().unwrap().take() {
-        let _ = sender.try_send(());
-    }
 }
 
 #[tauri::command]

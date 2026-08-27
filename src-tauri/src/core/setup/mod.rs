@@ -93,6 +93,12 @@ pub fn default(app_handle: &tauri::AppHandle) {
             _ => {}
         }
     });
+
+    let is_silent_start = std::env::args().any(|arg| arg == "--silent");
+    if !is_silent_start {
+        let _ = main_window.show();
+        let _ = main_window.set_focus();
+    }
 }
 
 // 提取计时器逻辑

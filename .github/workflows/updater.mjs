@@ -1,40 +1,78 @@
 // 注意要安装@actions/github依赖
 import { context, getOctokit } from "@actions/github";
-import { readFile } from "node:fs/promises";
-
 // 在容器中可以通过env环境变量来获取参数
 const octokit = getOctokit(process.env.GITHUB_TOKEN);
 
 const updateRelease = async () => {
-  // 获取updater tag的release
-  const { data: release } = await octokit.rest.repos.getReleaseByTag({
+  const repo = {
     owner: context.repo.owner,
     repo: context.repo.repo,
-    tag: "updater",
+  };
+  const tag = process.env.GITHUB_REF_NAME;
+
+  const { data: currentRelease } = await octokit.rest.repos.getReleaseByTag({
+    ...repo,
+    tag,
   });
+  const latestAsset = currentRelease.assets.find(
+    (item) => item.name === "latest.json",
+  );
+
+  if (!latestAsset) {
+    throw new Error(`latest.json was not found in release ${tag}`);
+  }
+
+  const { data: latestJson } = await octokit.request(
+    "GET /repos/{owner}/{repo}/releases/assets/{asset_id}",
+    {
+      ...repo,
+      asset_id: latestAsset.id,
+      headers: {
+        accept: "application/octet-stream",
+      },
+    },
+  );
+
+  let release;
+  try {
+    ({ data: release } = await octokit.rest.repos.getReleaseByTag({
+      ...repo,
+      tag: "updater",
+    }));
+  } catch (error) {
+    if (error.status !== 404) {
+      throw error;
+    }
+
+    ({ data: release } = await octokit.rest.repos.createRelease({
+      ...repo,
+      tag_name: "updater",
+      name: "Updater metadata",
+      body: "Metadata used by the in-app updater.",
+    }));
+  }
+
   // 删除旧的的文件
   const deletePromises = release.assets
     .filter((item) => item.name === "latest.json")
     .map(async (item) => {
       await octokit.rest.repos.deleteReleaseAsset({
-        owner: context.repo.owner,
-        repo: context.repo.repo,
+        ...repo,
         asset_id: item.id,
       });
     });
 
   await Promise.all(deletePromises);
 
-  // 上传新的文件
-  const file = await readFile("latest.json", { encoding: "utf-8" });
-
   await octokit.rest.repos.uploadReleaseAsset({
-    owner: context.repo.owner,
-    repo: context.repo.repo,
+    ...repo,
     release_id: release.id,
     name: "latest.json",
-    data: file,
+    data: latestJson,
+    headers: {
+      "content-type": "application/json",
+    },
   });
 };
 
-updateRelease();
+await updateRelease();
