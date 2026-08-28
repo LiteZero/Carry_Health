@@ -35,12 +35,21 @@ import { usePlatform } from "@/hooks/use-platform";
 const goldList = ["1000", "1500", "2000", "2500", "3000", "3500", "4000"];
 const gapList = ["10", "20", "30", "45", "60"];
 
+type ReminderConfig = {
+  gold: string;
+  gap: string;
+  weekdays: number[];
+  timeStart: string;
+  timeEnd: string;
+  whitelist_apps: string[];
+};
+
 if (process.env.NODE_ENV === "development") {
   gapList.unshift("1");
 }
 
 export default function Home() {
-  const [config, setConfig] = useState({
+  const [config, setConfig] = useState<ReminderConfig>({
     gold: goldList[0],
     gap: gapList[0],
     weekdays: [] as number[],
@@ -49,49 +58,47 @@ export default function Home() {
     whitelist_apps: [] as string[],
   });
   const [installedApps, setInstalledApps] = useState<string[]>([]);
-  const { isMacOS } = usePlatform();
+  const { isMacOS, isWindows } = usePlatform();
 
   useEffect(() => {
     // 加载已安装应用列表
-    if (isMacOS) {
-      invoke<string[]>("get_installed_apps").then(setInstalledApps);
+    if (isMacOS || isWindows) {
+      invoke<string[]>("get_installed_apps")
+        .then(setInstalledApps)
+        .catch((error) => console.error("加载应用列表失败:", error));
     }
-  }, [isMacOS]);
+  }, [isMacOS, isWindows]);
 
   useTray();
 
   useEffect(() => {
     async function loadConfig() {
       const store = await load(STORE_NAME.config, { autoSave: false });
-      const val = await store.get<{
-        gold: string;
-        gap: string;
-        weekdays: number[];
-        timeStart: string;
-        timeEnd: string;
-      }>("alert");
-      setConfig({
-        ...config,
-        ...val,
-      });
+      const val = await store.get<Partial<ReminderConfig>>("alert");
+      setConfig((current) => ({
+        ...current,
+        ...(val || {}),
+      }));
     }
 
     loadConfig();
   }, []);
 
-  const saveConfig = async (
-    filed: string,
-    value: string | number[] | string[]
+  const saveConfig = async <Field extends keyof ReminderConfig>(
+    field: Field,
+    value: ReminderConfig[Field]
   ) => {
-    setConfig({
-      ...config,
-      [filed]: value,
-    });
+    setConfig((current) => ({
+      ...current,
+      [field]: value,
+    }));
 
     const store = await load(STORE_NAME.config, { autoSave: false });
+    const savedConfig =
+      (await store.get<Partial<ReminderConfig>>("alert")) || {};
     await store.set("alert", {
-      ...config,
-      [filed]: value,
+      ...savedConfig,
+      [field]: value,
     });
     await store.save();
 
@@ -99,9 +106,7 @@ export default function Home() {
     invoke("reset_timer");
   };
 
-  const selectedApp = config.whitelist_apps.filter((app) =>
-    installedApps.includes(app)
-  );
+  const selectedApp = config.whitelist_apps;
 
   return (
     <div>
@@ -218,13 +223,13 @@ export default function Home() {
         <div className="flex items-center gap-2">
           <Select
             value={config.timeStart}
-            onValueChange={(value) => {
+            onValueChange={async (value) => {
               if (value >= config.timeEnd && config.timeEnd !== "00:00") {
                 const nextTimeIndex = timeList.indexOf(value) + 1;
                 const newEndTime = timeList[nextTimeIndex] || "00:00";
-                saveConfig("timeEnd", newEndTime);
+                await saveConfig("timeEnd", newEndTime);
               }
-              saveConfig("timeStart", value);
+              await saveConfig("timeStart", value);
             }}
             defaultValue={config.timeStart}
           >
@@ -268,14 +273,14 @@ export default function Home() {
         </div>
       </div>
 
-      {isMacOS && (
+      {(isMacOS || isWindows) && (
         <div className="flex flex-row items-center justify-between rounded-lg border p-3 shadow-xs mb-4">
           <div>
             <label className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
               应用白名单
             </label>
             <p className="text-[0.8rem] text-muted-foreground">
-              在这些应用活跃时暂停提醒
+              这些应用处于前台时暂停提醒
             </p>
           </div>
           <Popover>

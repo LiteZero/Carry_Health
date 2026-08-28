@@ -1,27 +1,31 @@
+use parking_lot::Mutex;
 use scopeguard;
-use std::path::Path;
-use std::ptr;
+use std::collections::HashMap;
 use windows::{
-    core::w,
     core::{HSTRING, PCWSTR, PWSTR},
-    Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, HANDLE},
-    Win32::System::ProcessStatus::GetModuleFileNameExW,
+    Win32::Foundation::CloseHandle,
     Win32::System::Registry::*,
-    Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
-    Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowTextLengthW, GetWindowThreadProcessId,
+    Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     },
-};
-use windows::{
-    core::*, Win32::Foundation::*, Win32::System::Threading::*, Win32::UI::WindowsAndMessaging::*,
+    Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
 };
 
+lazy_static::lazy_static! {
+    static ref APP_NAME_CACHE: Mutex<HashMap<String, Option<String>>> =
+        Mutex::new(HashMap::new());
+}
+
 pub fn check_whitelist(whitelist_apps: &Vec<String>) -> bool {
+    if whitelist_apps.is_empty() {
+        return false;
+    }
+
     unsafe {
         // 获取前台窗口句柄
         let hwnd = GetForegroundWindow();
         if hwnd.0 == 0 {
-            println!("[check_whitelist] Failed to get foreground window");
             return false;
         }
 
@@ -29,94 +33,84 @@ pub fn check_whitelist(whitelist_apps: &Vec<String>) -> bool {
         let mut process_id: u32 = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut process_id));
         if process_id == 0 {
-            println!("[check_whitelist] Failed to get process ID");
             return false;
         }
 
         // 打开进程
-        let process_handle = OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-            false,
-            process_id,
-        );
+        let process_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id);
 
         let process_handle = match process_handle {
             Ok(handle) => handle,
-            Err(e) => {
-                println!(
-                    "[check_whitelist] Failed to open process {}: {}",
-                    process_id, e
-                );
-                return false;
-            }
+            Err(_) => return false,
         };
 
         if process_handle.is_invalid() {
-            println!(
-                "[check_whitelist] Invalid process handle for process: {}",
-                process_id
-            );
             return false;
         }
 
         // 使用 scopeguard 确保进程句柄被正确关闭
         let _guard = scopeguard::guard(process_handle, |handle| unsafe {
-            CloseHandle(handle);
+            let _ = CloseHandle(handle);
         });
 
         // 获取进程可执行文件路径
-        let mut buffer = [0u16; 260];
-        let len = GetModuleFileNameExW(process_handle, None, &mut buffer);
+        let mut buffer = [0u16; 32768];
+        let mut len = buffer.len() as u32;
 
-        if len == 0 {
-            println!("[check_whitelist] Failed to get module filename");
+        if !QueryFullProcessImageNameW(
+            process_handle,
+            PROCESS_NAME_WIN32,
+            PWSTR::from_raw(buffer.as_mut_ptr()),
+            &mut len,
+        )
+        .as_bool()
+        {
             return false;
         }
 
-        // 转换路径为字符串并获取文件名
         let path = String::from_utf16_lossy(&buffer[..len as usize]);
-        println!("[check_whitelist] Process path: {}", path);
-
-        // 从注册表中查找应用名称
-        let app_name = get_app_name_from_path(&path);
-        println!("[check_whitelist] app_name {:?}", app_name);
-        match app_name {
-            Some(name) => {
-                let is_whitelisted = whitelist_apps
-                    .iter()
-                    .any(|app| app.to_lowercase() == name.to_lowercase());
-
-                println!(
-                    "[check_whitelist] App name: {}, Whitelisted: {}",
-                    name, is_whitelisted
-                );
-                is_whitelisted
-            }
-            None => {
-                println!("[check_whitelist] Failed to get app name from registry");
-                false
-            }
-        }
+        get_app_name_from_path(&path).is_some_and(|name| {
+            whitelist_apps
+                .iter()
+                .any(|app| app.eq_ignore_ascii_case(&name))
+        })
     }
 }
 
-// 新增函数：从可执行文件路径获取应用名称
 fn get_app_name_from_path(path: &str) -> Option<String> {
+    let normalized_path = normalize_windows_path(path);
+
+    if let Some(cached) = APP_NAME_CACHE.lock().get(&normalized_path).cloned() {
+        return cached;
+    }
+
+    let app_name = find_app_name_in_registry(&normalized_path);
+    APP_NAME_CACHE
+        .lock()
+        .insert(normalized_path, app_name.clone());
+    app_name
+}
+
+fn normalize_windows_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches(r"\\?\")
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
+fn find_app_name_in_registry(process_path: &str) -> Option<String> {
     unsafe {
-        // 遍历注册表路径
         let paths = [
             "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
             "SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
         ];
         let roots = [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER];
-        println!("[check_whitelist] roots {:?}", roots);
 
         for root in roots.iter() {
             for uninstall_path in paths.iter() {
                 let mut hkey = *root;
                 let uninstall_key = HSTRING::from(*uninstall_path);
 
-                println!("[check_whitelist] uninstall_key {:?}", uninstall_key);
                 if RegOpenKeyExW(
                     *root,
                     PCWSTR::from_raw(uninstall_key.as_ptr()),
@@ -133,7 +127,6 @@ fn get_app_name_from_path(path: &str) -> Option<String> {
                     let mut index = 0;
                     let mut name_buf = [0u16; 256];
 
-                    println!("[check_whitelist] index {:?}", index);
                     loop {
                         let mut name_size = name_buf.len() as u32;
                         match RegEnumKeyExW(
@@ -149,13 +142,11 @@ fn get_app_name_from_path(path: &str) -> Option<String> {
                         .ok()
                         {
                             Ok(_) => {
-                                // 检查这个注册表项的 InstallLocation 是否匹配
                                 let mut app_hkey = hkey;
                                 let app_key =
                                     String::from_utf16_lossy(&name_buf[..name_size as usize]);
-                                let full_key = format!("{}", app_key.trim_end_matches('\0'));
+                                let full_key = app_key.trim_end_matches('\0').to_string();
                                 let full_key_hstring = HSTRING::from(full_key);
-                                println!("[check_whitelist] app_hkey {:?}", app_hkey);
 
                                 if RegOpenKeyExW(
                                     hkey,
@@ -170,62 +161,28 @@ fn get_app_name_from_path(path: &str) -> Option<String> {
                                         let _ = RegCloseKey(h);
                                     });
 
-                                    // 读取 InstallLocation
-                                    let mut buffer = [0u16; 260];
-                                    let mut data_size = (buffer.len() * 2) as u32;
-                                    let mut data_type = REG_SZ;
-                                    let install_location = HSTRING::from("InstallLocation");
-                                    println!("[check_whitelist] data_size {:?}", data_size);
+                                    let display_name =
+                                        read_registry_string(app_hkey, "DisplayName");
+                                    let install_location =
+                                        read_registry_string(app_hkey, "InstallLocation");
+                                    let display_icon =
+                                        read_registry_string(app_hkey, "DisplayIcon");
 
-                                    if RegQueryValueExW(
-                                        app_hkey,
-                                        PCWSTR::from_raw(install_location.as_ptr()),
-                                        None,
-                                        Some(&mut data_type),
-                                        Some(buffer.as_mut_ptr() as *mut u8),
-                                        Some(&mut data_size),
-                                    )
-                                    .is_ok()
-                                    {
-                                        let len = data_size as usize / 2;
-                                        let location = String::from_utf16_lossy(&buffer[..len])
-                                            .trim_matches('\0')
-                                            .to_string();
-                                        println!("[check_whitelist] len {:?}", len);
-                                        println!("[check_whitelist] location {:?}", location);
+                                    if let Some(name) = display_name {
+                                        let matches_install_location = install_location
+                                            .as_deref()
+                                            .is_some_and(|location| {
+                                                path_is_inside(process_path, location)
+                                            });
+                                        let matches_display_icon = display_icon
+                                            .as_deref()
+                                            .and_then(display_icon_executable)
+                                            .is_some_and(|icon_path| {
+                                                normalize_windows_path(&icon_path) == process_path
+                                            });
 
-                                        if !location.is_empty() && path.starts_with(&location) {
-                                            // 找到匹配的应用，读取 DisplayName
-                                            let mut display_name_buf = [0u16; 256];
-                                            let mut data_size = (display_name_buf.len() * 2) as u32;
-                                            let mut data_type = REG_SZ;
-                                            let display_name = HSTRING::from("DisplayName");
-                                            println!(
-                                                "[check_whitelist] display_name {:?}",
-                                                display_name
-                                            );
-
-                                            if RegQueryValueExW(
-                                                app_hkey,
-                                                PCWSTR::from_raw(display_name.as_ptr()),
-                                                None,
-                                                Some(&mut data_type),
-                                                Some(display_name_buf.as_mut_ptr() as *mut u8),
-                                                Some(&mut data_size),
-                                            )
-                                            .is_ok()
-                                            {
-                                                let len = data_size as usize / 2;
-                                                let name = String::from_utf16_lossy(
-                                                    &display_name_buf[..len],
-                                                )
-                                                .trim_matches('\0')
-                                                .to_string();
-                                                println!("[check_whitelist] name {:?}", name);
-                                                if !name.is_empty() {
-                                                    return Some(name);
-                                                }
-                                            }
+                                        if matches_install_location || matches_display_icon {
+                                            return Some(name);
                                         }
                                     }
                                 }
@@ -239,6 +196,58 @@ fn get_app_name_from_path(path: &str) -> Option<String> {
         }
         None
     }
+}
+
+fn read_registry_string(key: HKEY, value_name: &str) -> Option<String> {
+    unsafe {
+        let mut buffer = [0u16; 1024];
+        let mut data_size = (buffer.len() * 2) as u32;
+        let mut data_type = REG_SZ;
+        let value_name = HSTRING::from(value_name);
+
+        if RegQueryValueExW(
+            key,
+            PCWSTR::from_raw(value_name.as_ptr()),
+            None,
+            Some(&mut data_type),
+            Some(buffer.as_mut_ptr() as *mut u8),
+            Some(&mut data_size),
+        )
+        .is_err()
+        {
+            return None;
+        }
+
+        let len = (data_size as usize / 2).min(buffer.len());
+        let value = String::from_utf16_lossy(&buffer[..len])
+            .trim_matches('\0')
+            .trim()
+            .to_string();
+
+        (!value.is_empty()).then_some(value)
+    }
+}
+
+fn display_icon_executable(display_icon: &str) -> Option<String> {
+    let display_icon = display_icon.trim();
+    let path = if let Some(quoted) = display_icon.strip_prefix('"') {
+        quoted.split('"').next()
+    } else {
+        display_icon.split(',').next()
+    }?;
+
+    let path = path.trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn path_is_inside(process_path: &str, install_location: &str) -> bool {
+    let install_location = normalize_windows_path(install_location)
+        .trim_end_matches('\\')
+        .to_string();
+
+    !install_location.is_empty()
+        && (process_path == install_location
+            || process_path.starts_with(&format!("{}\\", install_location)))
 }
 
 pub fn get_local_installed_apps(app_handle: &tauri::AppHandle) -> Vec<String> {
@@ -323,7 +332,7 @@ fn scan_registry_key(
                     index += 1;
                 }
                 // Err(e) if e.code() == ERROR_NO_MORE_ITEMS => break,
-                Err(e) => return Err(e),
+                Err(_) => break,
             }
         }
 
